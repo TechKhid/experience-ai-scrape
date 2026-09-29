@@ -1,0 +1,12 @@
+# Session cookie: never commit
+cookie.txt
+
+# Scraped data and caches
+cache/
+data/
+output/
+
+__pycache__/
+*.pyc
+*.part
+*.tmp
