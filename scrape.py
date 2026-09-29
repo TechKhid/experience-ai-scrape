@@ -312,7 +312,7 @@ def export_url(kind, gid, ext):
     return f"https://docs.google.com/{kind}/d/{gid}/export?format={ext}"
 
 
-def resolve(client):
+def resolve(client, locales):
     """For each (locale, id): follow the Google Drive redirect once to learn the file ID.
     Download URLs for native Google files are then built locally; anything else is
     resolved per format through the site's own download endpoint."""
@@ -320,6 +320,8 @@ def resolve(client):
     resolved = jload(DATA / "resolved.json", {})
     wanted = {}
     for page in catalog.values():
+        if page.get("locale") not in locales:
+            continue
         for r in page.get("resources", []):
             wanted.setdefault(f"{page['locale']}/{r['id']}", set()).add(r["ext"])
     todo = [k for k in wanted
@@ -405,12 +407,12 @@ def page_dir(page, catalog):
     return OUT / loc / "_pages" / safe("__".join(parts) or "home")
 
 
-def download(client, link_fallbacks=True):
+def download(client, locales, link_fallbacks=True):
     catalog = jload(DATA / "catalog.json", {})
     resolved = jload(DATA / "resolved.json", {})
     blobs = jload(DATA / "blobs.json", {})          # "<gid>.<ext>" -> first local path
     manifest = []
-    pages = [p for p in catalog.values() if p.get("status") == 200]
+    pages = [p for p in catalog.values() if p.get("status") == 200 and p.get("locale") in locales]
     total = sum(len(p["resources"]) for p in pages)
     done = 0
     for page in sorted(pages, key=lambda p: (p["locale"] != "en", p["path"])):
@@ -479,7 +481,9 @@ def download(client, link_fallbacks=True):
                 jsave(DATA / "blobs.json", blobs)
                 log(f"  {done}/{total} resource files")
     jsave(DATA / "blobs.json", blobs)
-    write_manifest(manifest)
+    # Keep manifest rows for locales not processed in this run
+    kept = [m for m in jload(DATA / "manifest.json", []) if m["locale"] not in locales]
+    write_manifest(kept + manifest)
     counts = {}
     for m in manifest:
         counts[m["status"].split(" ")[0]] = counts.get(m["status"].split(" ")[0], 0) + 1
@@ -530,11 +534,11 @@ def main():
                      "post-login questionnaire in the browser if you haven't).")
         crawl(client, locales, a.refresh)
     if a.stage in ("resolve", "all"):
-        resolve(client)
+        resolve(client, locales)
     if a.stage in ("verify", "all"):
         verify_resolution(client)
     if a.stage in ("download", "all"):
-        download(client, link_fallbacks=not a.no_link)
+        download(client, locales, link_fallbacks=not a.no_link)
 
 
 if __name__ == "__main__":

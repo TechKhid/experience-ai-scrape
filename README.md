@@ -33,11 +33,24 @@ It should print `logged in; N download links on lesson 12`.
 
 ## 2. Run
 
+English first (the main target). This crawls, resolves and downloads English only:
+
+```bash
+python scrape.py all --locales en
+```
+
+Then the rest. English is skipped because it's already cached and downloaded:
+
 ```bash
 python scrape.py all
 ```
 
-or run the stages one at a time:
+`all` runs the stages in order, and each stage finishes for every selected locale before the next one
+starts. So no files are downloaded until the crawl of all selected locales is done. That's why
+it's worth doing English on its own first. `en-US` and `en-IN` are separate English variants;
+add them with `--locales en,en-US,en-IN` if you want them.
+
+You can also run the stages one at a time:
 
 | Stage      | What it does                                                               |
 |------------|----------------------------------------------------------------------------|
@@ -48,7 +61,7 @@ or run the stages one at a time:
 
 Useful options:
 
-- `--locales en,de,pl`: only these locales (default is all 25)
+- `--locales en,de,pl`: only these locales (default is all 25). Applies to every stage.
 - `--delay 1.5`: slow down if you see many retries (default is 0.8 s between requests)
 - `--refresh`: ignore the page cache
 - `--no-link`: don't hardlink English fallback files into other locales' folders
@@ -56,13 +69,7 @@ Useful options:
 Every stage is **resumable**. If it stops, run the same command again and it
 continues where it left off.
 
-Try English first to confirm the lesson resources are picked up:
-
-```bash
-python scrape.py all --locales en
-```
-
-The crawl log line should say `0 gated pages`.
+The crawl log line should say `0 gated pages`. If it doesn't, your cookie isn't working.
 
 ## Output
 
