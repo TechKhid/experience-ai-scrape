@@ -58,8 +58,12 @@ class Client:
         self.last = {}
 
     def get(self, url, **kw):
+        """Throttling (429, resets, timeouts) gets a long backoff and raises FetchError if it
+        never clears. A 5xx is usually a broken page, not throttling: after a few quick
+        retries the 5xx response is returned for the caller to record and skip."""
         host = urlparse(url).netloc
         delay = self.delay if host == "experience-ai.org" else 0.3
+        server_errors = 0
         for attempt in range(7):
             wait = self.last.get(host, 0) + delay - time.time()
             if wait > 0:
@@ -67,15 +71,25 @@ class Client:
             try:
                 r = self.s.get(url, timeout=60, **kw)
                 self.last[host] = time.time()
-                if r.status_code == 429 or r.status_code >= 500:
+                if r.status_code >= 500:
+                    server_errors += 1
+                    if server_errors >= 3:
+                        log(f"  HTTP {r.status_code} persists for {url} — skipping")
+                        return r
                     raise requests.HTTPError(f"HTTP {r.status_code}")
+                if r.status_code == 429:
+                    raise requests.HTTPError("HTTP 429")
                 return r
             except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:
                 self.last[host] = time.time()
                 backoff = min(5 * 2 ** attempt, 300)
                 log(f"  retry {attempt + 1} for {url} in {backoff}s ({e.__class__.__name__}: {str(e)[:80]})")
                 time.sleep(backoff)
-        raise RuntimeError(f"giving up on {url}")
+        raise FetchError(f"giving up on {url}")
+
+
+class FetchError(Exception):
+    pass
 
 
 def load_cookie():
@@ -115,6 +129,8 @@ def fetch_page(client, path, refresh=False):
         if not stale:
             return meta.get("status", 200), html
     r = client.get(BASE + path, allow_redirects=False)
+    if r.status_code >= 500:
+        return r.status_code, ""    # not cached, so the next run tries it again
     html = r.text if r.status_code == 200 else ""
     cp.parent.mkdir(parents=True, exist_ok=True)
     cp.write_text(html, encoding="utf8")
@@ -230,6 +246,7 @@ def parse_page(path, html):
 def crawl(client, locales, refresh=False):
     catalog = jload(DATA / "catalog.json", {})
     unknown = set()
+    failed = []
     for loc in locales:
         queue = [f"/{loc}", f"/{loc}/units", f"/{loc}/partners"]
         seen = set()
@@ -239,9 +256,15 @@ def crawl(client, locales, refresh=False):
             if path in seen:
                 continue
             seen.add(path)
-            status, html = fetch_page(client, path, refresh)
+            try:
+                status, html = fetch_page(client, path, refresh)
+            except FetchError as e:
+                log(f"  FAILED {path}: {e}")
+                status, html = "unreachable", ""
             if status != 200:
                 catalog[path] = {"path": path, "locale": loc, "status": status}
+                if status == "unreachable" or status >= 500:
+                    failed.append(f"{path} ({status})")
                 continue
             info = parse_page(path, html)
             info["status"] = status
@@ -270,6 +293,8 @@ def crawl(client, locales, refresh=False):
         jsave(DATA / "catalog.json", catalog)
     if unknown:
         log("Paths outside locale trees (not crawled):", sorted(unknown)[:30])
+    if failed:
+        log(f"{len(failed)} page(s) failed (server errors; re-run later to retry): " + ", ".join(failed))
     return catalog
 
 
@@ -297,33 +322,43 @@ def resolve(client):
     for page in catalog.values():
         for r in page.get("resources", []):
             wanted.setdefault(f"{page['locale']}/{r['id']}", set()).add(r["ext"])
-    todo = [k for k in wanted if k not in resolved or set(wanted[k]) - set(resolved[k].get("urls", {}))]
+    todo = [k for k in wanted
+            if set(wanted[k]) - {e for e, u in resolved.get(k, {}).get("urls", {}).items() if u}]
     log(f"resolve: {len(wanted)} (locale, resource) pairs, {len(todo)} to do")
+    failed = []
     for i, key in enumerate(todo, 1):
         loc, rid = key.split("/")
         entry = resolved.get(key, {"urls": {}})
-        if "target" not in entry:
-            r = client.get(f"{BASE}/{loc}/drive_resources/redirect/{rid}", allow_redirects=False)
-            entry["target"] = r.headers.get("location")
-        m = GDOC_RE.match(entry["target"] or "")
-        for ext in sorted(wanted[key]):
-            if ext in entry["urls"]:
-                continue
-            if m:
-                entry["kind"], entry["gid"] = m.group(1), m.group(2)
-                entry["urls"][ext] = export_url(m.group(1), m.group(2), ext)
-            else:
-                r = client.get(f"{BASE}/{loc}/drive_resources/download/{rid}.{ext}", allow_redirects=False)
-                loc_url = r.headers.get("location")
-                fm = GFILE_RE.match(loc_url or "") or GDOC_RE.match(loc_url or "")
-                entry["kind"] = "file"
-                entry["gid"] = fm.groups()[-1] if fm else None
-                entry["urls"][ext] = loc_url
+        try:
+            if not entry.get("target"):
+                r = client.get(f"{BASE}/{loc}/drive_resources/redirect/{rid}", allow_redirects=False)
+                entry["target"] = r.headers.get("location")
+            m = GDOC_RE.match(entry["target"] or "")
+            for ext in sorted(wanted[key]):
+                if entry["urls"].get(ext):
+                    continue
+                if m:
+                    entry["kind"], entry["gid"] = m.group(1), m.group(2)
+                    entry["urls"][ext] = export_url(m.group(1), m.group(2), ext)
+                else:
+                    r = client.get(f"{BASE}/{loc}/drive_resources/download/{rid}.{ext}", allow_redirects=False)
+                    loc_url = r.headers.get("location")
+                    if not loc_url:     # 5xx or no redirect: leave unresolved so the next run retries
+                        failed.append(f"{key}.{ext} (HTTP {r.status_code})")
+                        continue
+                    fm = GFILE_RE.match(loc_url) or GDOC_RE.match(loc_url)
+                    entry["kind"] = "file"
+                    entry["gid"] = fm.groups()[-1] if fm else None
+                    entry["urls"][ext] = loc_url
+        except FetchError as e:
+            failed.append(f"{key} ({e})")
         resolved[key] = entry
         if i % 25 == 0 or i == len(todo):
             jsave(DATA / "resolved.json", resolved)
             log(f"  resolved {i}/{len(todo)}")
     jsave(DATA / "resolved.json", resolved)
+    if failed:
+        log(f"{len(failed)} resource(s) could not be resolved (re-run later to retry): " + ", ".join(failed[:20]))
     return resolved
 
 
@@ -333,8 +368,14 @@ def verify_resolution(client, samples=6):
     bad = 0
     for key, e in list(resolved.items())[:: max(1, len(resolved) // samples)][:samples]:
         loc, rid = key.split("/")
+        if not e.get("urls"):
+            continue
         ext = sorted(e["urls"])[0]
-        r = client.get(f"{BASE}/{loc}/drive_resources/download/{rid}.{ext}", allow_redirects=False)
+        try:
+            r = client.get(f"{BASE}/{loc}/drive_resources/download/{rid}.{ext}", allow_redirects=False)
+        except FetchError as err:
+            log(f"  verify {key}.{ext}: skipped ({err})")
+            continue
         ok = r.headers.get("location") == e["urls"][ext]
         bad += not ok
         log(f"  verify {key}.{ext}: {'ok' if ok else 'MISMATCH ' + str(r.headers.get('location'))}")
@@ -413,7 +454,13 @@ def download(client, link_fallbacks=True):
                     row["status"] = "duplicate"
                     row["local_path"] = first
             else:
-                resp = client.get(url, allow_redirects=True)
+                try:
+                    resp = client.get(url, allow_redirects=True)
+                except FetchError as err:
+                    row["status"] = "failed (unreachable)"
+                    log(f"  FAILED {page['locale']} {r['title']}.{r['ext']}: {err}")
+                    manifest.append(row)
+                    continue
                 ctype = resp.headers.get("content-type", "")
                 if resp.status_code != 200 or ctype.startswith("text/html"):
                     row["status"] = f"failed ({resp.status_code} {ctype.split(';')[0]})"
@@ -458,7 +505,7 @@ def check_auth(client):
         log(f"auth check: HTTP {status}")
         return False
     gated = GATED_MARKER in html
-    n = len(DOWNLOAD_RE.findall(html))
+    n = len(set(re.findall(r"/drive_resources/download/\d+\.\w+", html)))
     log(f"auth check: {'GATED (not logged in)' if gated else 'logged in'}; {n} download links on lesson 12")
     return not gated
 
